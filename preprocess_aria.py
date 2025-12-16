@@ -1,17 +1,15 @@
 """
-Script to create the MIDI dataset from a collection of MIDI files.
+Script to create the MIDI dataset from a collection of Aria MIDI files.
 """
 
 from __future__ import annotations
 import os
 import logging
 import hashlib
-import shutil
 import json
 import typing as t
 from copy import deepcopy
 from pathlib import Path
-import argparse
 from tqdm import tqdm
 from datasets import Dataset
 
@@ -30,12 +28,9 @@ def find_midi_files(
     verbose: bool = True,
 ) -> t.Generator[str, None, None]:
     """Returns a list of all MIDI files in the directory and subdirectories."""
-    midi_files_found = tqdm(desc=" MIDI files found...", unit="file", leave=True, disable=not verbose)
     for ext in exts:
         for path in Path(base_path).rglob('*' + ext):
             yield str(path)
-            midi_files_found.update(1)
-    midi_files_found.close()
 
 
 def compute_hash(file_path: str) -> str | None:
@@ -69,6 +64,11 @@ def grab_metadata(metadata: dict[str, t.Any], files: t.Iterable[str]) -> t.Gener
     """Extract metadata from a MIDI file."""
     for file_path in files:
         key = os.path.basename(file_path).split("_")[0].lstrip("0")
+        
+        if not key:
+            logging.warning(f"Could not extract key from filename {file_path}. Skipping.")
+            continue
+
         if key not in metadata:
             logging.warning(f"Metadata for file {file_path} ({key}) not found.")
             continue
@@ -81,7 +81,7 @@ def grab_metadata(metadata: dict[str, t.Any], files: t.Iterable[str]) -> t.Gener
 
         try:
             song_metadata = deepcopy(metadata[key]["metadata"])
-            song_metadata["audio_scores"] = metadata[key]["audio_scores"]
+            song_metadata["audio_scores"] = json.dumps(metadata[key]["audio_scores"])
             song_metadata["file"] = midi_bytes
             yield song_metadata
         except Exception as e:
@@ -89,19 +89,16 @@ def grab_metadata(metadata: dict[str, t.Any], files: t.Iterable[str]) -> t.Gener
             continue
 
 
-def collect_files(metadata_keys: frozenset[str], file_metadata_iter: t.Iterable[dict[str, t.Any]], count: int = -1) -> Dataset:
-    # Transpose the whole thing
-    dataset: dict[str, list[t.Any]] = {key: [] for key in metadata_keys}
-    for song_metadata in tqdm(file_metadata_iter, desc="Collecting files...", unit="file"):
-        for key in metadata_keys:
-            dataset[key].append(song_metadata.get(key, None))
-        count -= 1
-        if count == 0:
-            break
-
-    # Convert to hf dataset
-    ds = Dataset.from_dict(dataset)
-    return ds
+def row_generator(base_directory: str, metadata: dict, metadata_keys: frozenset[str]):
+    """
+    Generator function specifically for Dataset.from_generator.
+    It orchestrates the finding, deduplicating, and formatting of data.
+    """
+    midi_files = find_midi_files(base_directory)
+    unique_midi_files = deduplicate_files(midi_files)
+    raw_generator = grab_metadata(metadata, unique_midi_files)
+    for song_metadata in raw_generator:
+        yield {key: song_metadata.get(key, None) for key in metadata_keys}
 
 
 def login_to_hf():
@@ -115,12 +112,6 @@ def login_to_hf():
     login(token=hf_token)
 
 
-def upload_to_hf(dataset: Dataset, ds_name: str):
-    """Upload dataset to Hugging Face."""
-    dataset.push_to_hub(ds_name)
-    logging.info(f"Dataset uploaded to Hugging Face under the name: {ds_name}")
-
-
 def main(base_directory: str, ds_name: str):
     """Create a dataset from a directory."""
     if not os.path.exists(base_directory):
@@ -131,9 +122,11 @@ def main(base_directory: str, ds_name: str):
     # Login to HF
     login_to_hf()
 
+    logging.info("Loading metadata.json...")
     with open(os.path.join(base_directory, "metadata.json"), 'r') as f:
         metadata = json.load(f)
 
+    # Determine all possible keys to ensure schema consistency
     keys = set()
     for key in metadata.keys():
         keys.update(metadata[key]["metadata"].keys())
@@ -141,14 +134,24 @@ def main(base_directory: str, ds_name: str):
     keys.add("file")
     metadata_keys = frozenset(keys)
 
-    midi_files = find_midi_files(base_directory)
-    unique_midi_files = deduplicate_files(midi_files)
-    file_metadata_iter = grab_metadata(metadata, unique_midi_files)
-    dataset = collect_files(metadata_keys, file_metadata_iter)
-
-    dataset.save_to_disk(f"./{ds_name}_dataset")
+    logging.info("Starting Dataset generation (streaming to disk)...")
+    
+    dataset = Dataset.from_generator(
+        row_generator,
+        gen_kwargs={
+            "base_directory": base_directory,
+            "metadata": metadata,
+            "metadata_keys": metadata_keys
+        },
+    )
 
     logging.info(f"Dataset created with {len(dataset)} entries.")
+    
+    save_path = f"./{ds_name}_dataset"
+    dataset.save_to_disk(save_path)
+    logging.info(f"Dataset saved locally to {save_path}")
+
+    logging.info(f"Pushing to Hugging Face Hub: {ds_name}...")
     dataset.push_to_hub(ds_name)
     logging.info(f"Dataset '{ds_name}' successfully created and uploaded.")
 
@@ -162,7 +165,7 @@ if __name__ == "__main__":
     base_directory = sys.argv[1]
     ds_name = os.path.basename(os.path.normpath(base_directory))
     print(f"Creating dataset from directory: {base_directory} with name: {ds_name}")
-    dataset = main(
+    main(
         base_directory=base_directory,
         ds_name=ds_name,
     )

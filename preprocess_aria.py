@@ -154,8 +154,15 @@ def main(base_directory: str, ds_name: str):
 
 
 if __name__ == "__main__":
-    # Example usage
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: python preprocess_aria.py <base_directory>")
+        sys.exit(1)
+
+    base_directory = sys.argv[1]
+    ds_name = os.path.basename(os.path.normpath(base_directory))
+    print(f"Creating dataset from directory: {base_directory} with name: {ds_name}")
     dataset = main(
-        base_directory=r"C:\Users\User\Downloads\aria-midi-v1-pruned-ext\aria-midi-v1-pruned-ext",
-        ds_name="aria-midi-v1-pruned-ext",
+        base_directory=base_directory,
+        ds_name=ds_name,
     )
